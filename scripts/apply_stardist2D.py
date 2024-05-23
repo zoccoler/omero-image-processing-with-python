@@ -29,52 +29,14 @@ def add_map_annotation(conn, key_value_data, image_id):
 
 def add_tag_annotation(conn, tag_text, image_id):
     '''Add a tag to an image'''
-    # tag_ann = None
-    # for tag in conn.getObjects("TagAnnotation"):
-    #     if tag_text == tag.textValue:
-    #         tag_ann = tag
-    # if not tag_ann:
     tag_ann = TagAnnotationWrapper(conn)
     tag_ann.setValue(tag_text)
     tag_ann.save()
 
     omero_image = conn.getObject("Image", image_id)
     omero_image.linkAnnotation(tag_ann)
-    # clean_duplicated_tags(conn)
 
     return
-
-
-def clean_duplicated_tags(conn):
-    # create a list of tags and append only the tags, tag id and tag owner id to it
-    tags = []
-
-    for tag in conn.getObjects("TagAnnotation"):
-        owner = tag.getDetails().owner.id.val
-        # print tag.textValue, owner
-        tags.append([tag.textValue, str(tag.id), str(owner)])
-
-    # sort the tags in descending order to allow to see duplicates
-
-    tags.sort(key=lambda tag: tag[0].lower())
-    print("sorted tags", tags)
-
-    prev_tag = ""
-    prev_id = 0
-    for t in tags:
-        tag_id = str(t[1])
-        if t[0] == prev_tag:
-            # move all tagged objects to previous tags and delete
-            for link in conn.getAnnotationLinks('Image', ann_ids=[tag_id]):
-                link._obj.child = omero.model.TagAnnotationI(prev_id, False)
-                link.save()
-            conn.deleteObjects('TagAnnotation', [tag_id])
-        prev_tag = t[0]
-        prev_id = tag_id
-    return
-
-# We have a helper function for creating an ROI and linking it to new shapes
-
 
 def create_roi(updateService, img, shapes):
     # create an ROI, link it to Image
@@ -176,8 +138,6 @@ def create_image_from_tiles(conn, source, blocks, labels, image_name, model_name
             current_tile2d = next_tile()
             print("current_tile2d type", type(current_tile2d))
             print("current_tile2d shape", current_tile2d.shape)
-            print(current_tile2d[0, 0])
-            print(current_tile2d.dtype)
             data.setTile(current_tile2d, z, c, t, x,
                          y, tile_width, tile_height)
 
@@ -207,6 +167,7 @@ def apply_stardist2D(conn, scriptParams):
     else:
         ch = 0
     print('channel = ', ch, type(ch))
+    delete_ROIs = scriptParams["Delete_Previous_ROIs"]
 
     # Get list of images
     image_list, name_list = [], []
@@ -214,11 +175,6 @@ def apply_stardist2D(conn, scriptParams):
         dataset_id = ids[0]
         dataset = conn.getObject(dataType, dataset_id)
         image_ids = ezomero.get_image_ids(conn, dataset=dataset_id)
-        # for ds in objects:
-        #     print("Processing Images from Dataset: %s" % ds.getName())
-        #     imgs = list(ds.listChildren())
-        #     image_list.extend(imgs)
-        #     name_list = [img.getName() for img in imgs]
     else:
         print("Processing Images identified by ID")
         image_ids = ids
@@ -232,13 +188,6 @@ def apply_stardist2D(conn, scriptParams):
         dataset = im_object.getParent()
         print("From Dataset: ", dataset.getName())
         dataset_id = dataset.getId()
-
-        # image_list = objects
-        # name_list.append(image_list[0].getName())
-        # # get dataset
-        # dataset = image_list[0].getParent()
-        # print("From Dataset: ", dataset.getName())
-        # dataset_id = dataset.getId()
 
     # Stardist model
     # creates a pretrained model
@@ -257,6 +206,15 @@ def apply_stardist2D(conn, scriptParams):
                        im_object.getSizeC(),
                        im_object.getSizeT())
         print('image_shape = ', image_shape)
+
+        if delete_ROIs:
+            # Delete ROIs from previous runs
+            roi_service = conn.getRoiService()
+            result = roi_service.findByImage(image_id, None)
+            roi_ids = [roi.id.val for roi in result.rois]
+            if roi_ids:
+                conn.deleteObjects("Roi", roi_ids)
+
         # Get pyramid levels
         try:
             levels = ezomero.get_pyramid_levels(conn, image_id)
@@ -297,7 +255,6 @@ def apply_stardist2D(conn, scriptParams):
                                             )
                 print(tile.shape)
                 tile2d = tile.squeeze()
-                print(tile2d.shape)
                 ########
                 # Here maybe check if tile has lots of zeros and circunvent predictions for that tile
                 # It may also be useful to provide level number and min_overlap percentage to advanced part of user interface
@@ -316,28 +273,10 @@ def apply_stardist2D(conn, scriptParams):
                 # Update labels offset
                 label_offset += len(polys['prob'])
 
-            # tiles = []
-            # def tile_gen():
-            #     for block in blocks:
-            #         slc = block.slice_read()
-            #         y_start, y_stop = slc[0].start, slc[0].stop
-            #         x_start, x_stop = slc[1].start, slc[1].stop
-            #         tile = labels[y_start:y_stop, x_start:x_stop]
-            #         # tile = tile[...,np.newaxis,np.newaxis,np.newaxis]
-            #         tiles.append(tile)
-            #     for tile in tiles:
-            #         yield tile
-            # # Creates Omero image from numpy array
-            # label_image_name = name + "_label_" + chosen_model
-            # desc = "labeled image"
-            # omero_image = conn.createImageFromNumpySeq(
-            #     tile_gen(), label_image_name, 1, 1, 1, description=desc,
-            #     dataset=dataset)
             desc = "labeled image"
             tile_size = block_size
             new_tiled_image = create_image_from_tiles(conn, im_object, blocks, labels, name, chosen_model, desc,
                                                       tile_size)
-            print('new_tiled_image = ', new_tiled_image)
         # If image is not in pyramid structure, apply stardist to whole image
         else:
             _, im = ezomero.get_image(conn, image_id,
@@ -348,36 +287,30 @@ def apply_stardist2D(conn, scriptParams):
             # Creates Omero image from numpy array
             planes = [labels]
 
-            def plane_gen():
-                """generator will yield planes"""
-                for p in planes:
-                    yield p
             label_image_name = name + "_label_" + chosen_model
             desc = "labeled image"
-            omero_image = conn.createImageFromNumpySeq(
-                plane_gen(), label_image_name, 1, 1, 1, description=desc,
-                dataset=dataset)
+            
+            # Reshape to match omero standards
+            labels = labels[:,:,np.newaxis, np.newaxis, np.newaxis] # make it xyzct
+            # save label image in the same dataset
+            im_id = ezomero.post_image(conn, labels, label_image_name,
+                                    dataset_id=dataset_id,
+                                    dim_order = 'xyzct') # xyzct led to rotated
+            omero_image, image = ezomero.get_image(conn, im_id, no_pixels=True)
+
         print('labels_shape = ', labels.shape)
 
         # Create ROIs from label image
         msks = omero_rois.masks_from_label_image(
-            labels, raise_on_no_mask=False)
+            np.swapaxes(labels, 0, 1), raise_on_no_mask=False)
         rgba_list = make_rgba_list(labels)
+
         for msk, rgba in zip(msks, rgba_list[1:]):
             msk.fillColor = omero.rtypes.rint(rgba_to_int(*rgba))
         create_roi(updateService, im_object, msks)
 
-        # Reshape to match omero standards
-        # labels = labels[:,:,np.newaxis, np.newaxis, np.newaxis] # make it xyzct
-        # save label image in the same dataset
-
-        # im_id = ezomero.post_image(conn, labels, label_image_name,
-        #                            dataset_id=dataset_id,
-        #                            dim_order = 'yxzct') # xyzct led to rotated
-
         print('Created new Image:%s Name:"%s"' %
               (omero_image.getId(), omero_image.getName()))
-        im_id = omero_image.getId()
 
         # Add key_values indicating source image and stardist model used
         key_value_data = [["Source_Image", name],
@@ -386,6 +319,11 @@ def apply_stardist2D(conn, scriptParams):
                           ["Number of Nuclei", str(np.amax(labels))]]
         add_map_annotation(conn, key_value_data, im_id)
 
+        # Add nuclei number as key-value pair to original image
+        key_value_data = [["Number of Nuclei", str(np.amax(labels))]]
+        add_map_annotation(conn, key_value_data, image_id)
+
+        # TODO: Avoid adding tags if they already exist (check first if tag exists, then add it)
         # Add tags indicating label image from stardist2D
         tags = ["label", "stardist2D"]
         [add_tag_annotation(conn, tag, im_id) for tag in tags]
@@ -429,14 +367,11 @@ if __name__ == "__main__":
 
         scripts.String(
             "Channel_Number", optional=True, grouping="4.1",
-            description="The channel number (first channel is 0).")
+            description="The channel number (first channel is 0)."),
 
-        # TO DO: allow using custom stardist2D model from file
-        # scripts.Bool("Use_Custom_Model", grouping="4", default=False),
-
-        # scripts.String(
-        #     "Model_Name", optional=True, grouping="4.1",
-        #     description="The model file name.")
+        scripts.Bool(
+            "Delete_Previous_ROIs", optional=False, default=True, grouping="5",
+            description="Delete previous ROIs from Stardist2D?"),
 
     )
 
